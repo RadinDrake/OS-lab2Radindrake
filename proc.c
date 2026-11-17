@@ -272,21 +272,40 @@ exit(void)
 int
 wait(void)
 {
+  return waitpid(-1);
+}
+
+// Wait for a specific child to exit and return its pid.
+// pid == -1 waits for any child, like wait().
+// Returns -1 immediately if pid is invalid (0 or < -1), is not a child
+// of the caller (never existed, already reaped, someone else's child),
+// or if the caller is killed while waiting.
+// A zombie child other than the target is never reaped here.
+int
+waitpid(int pid)
+{
   struct proc *p;
-  int havekids, pid;
+  int havekids, found;
   struct proc *curproc = myproc();
-  
+
+  if(pid == 0 || pid < -1)
+    return -1;
+
   acquire(&ptable.lock);
   for(;;){
-    // Scan through table looking for exited children.
+    // Scan through table looking for the target (or any, for -1).
+    // The check for zombies and the call to sleep() both happen under
+    // ptable.lock, so an exit() between them cannot be missed.
     havekids = 0;
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
       if(p->parent != curproc)
         continue;
+      if(pid != -1 && p->pid != pid)
+        continue;
       havekids = 1;
       if(p->state == ZOMBIE){
         // Found one.
-        pid = p->pid;
+        found = p->pid;
         kfree(p->kstack);
         p->kstack = 0;
         freevm(p->pgdir);
@@ -296,11 +315,11 @@ wait(void)
         p->killed = 0;
         p->state = UNUSED;
         release(&ptable.lock);
-        return pid;
+        return found;
       }
     }
 
-    // No point waiting if we don't have any children.
+    // No point waiting if we don't have a matching child.
     if(!havekids || curproc->killed){
       release(&ptable.lock);
       return -1;

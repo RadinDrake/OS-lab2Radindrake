@@ -16,6 +16,9 @@
 #include "file.h"
 #include "fcntl.h"
 
+#define MAXSYMLINK  128   // max length of a symlink target path
+#define MAXSYMLINKS 10    // max links followed by one open()
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -282,6 +285,32 @@ create(char *path, short type, short major, short minor)
   return ip;
 }
 
+// Resolve symlinks starting at locked inode ip.  Follows at most MAXSYMLINKS
+// links; a dangling link, a read error or a longer chain (e.g. a loop)
+// fails.  On success returns the locked, non-symlink target inode.  On
+// failure returns 0 with every inode released.  Caller holds a transaction.
+static struct inode*
+followlinks(struct inode *ip)
+{
+  char target[MAXSYMLINK + 1];
+  int depth;
+
+  for(depth = 0; ip->type == T_SYMLINK; depth++){
+    if(depth >= MAXSYMLINKS ||
+       ip->size == 0 || ip->size > MAXSYMLINK ||
+       readi(ip, target, 0, ip->size) != ip->size){
+      iunlockput(ip);
+      return 0;
+    }
+    target[ip->size] = 0;
+    iunlockput(ip);
+    if((ip = namei(target)) == 0)
+      return 0;
+    ilock(ip);
+  }
+  return ip;
+}
+
 int
 sys_open(void)
 {
@@ -293,9 +322,15 @@ sys_open(void)
   if(argstr(0, &path) < 0 || argint(1, &omode) < 0)
     return -1;
 
+  // "Create" and "don't follow" contradict each other.
+  if((omode & O_NOFOLLOW) && (omode & O_CREATE))
+    return -1;
+
   begin_op();
 
   if(omode & O_CREATE){
+    // create() refuses to touch an existing symlink (even a dangling one),
+    // so this fails with -1 instead of following it or replacing it.
     ip = create(path, T_FILE, 0, 0);
     if(ip == 0){
       end_op();
@@ -307,7 +342,13 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
+    if(!(omode & O_NOFOLLOW) && (ip = followlinks(ip)) == 0){
+      end_op();
+      return -1;
+    }
+    // Directories and symlinks opened with O_NOFOLLOW are read-only.
+    if((ip->type == T_DIR || ip->type == T_SYMLINK) &&
+       (omode & ~O_NOFOLLOW) != O_RDONLY){
       iunlockput(ip);
       end_op();
       return -1;
@@ -446,5 +487,28 @@ sys_pipe(void)
 int
 sys_symlink(void)
 {
-  return -1;
+  char *target, *path;
+  struct inode *ip;
+  int len;
+
+  if(argstr(0, &target) < 0 || argstr(1, &path) < 0)
+    return -1;
+  len = strlen(target);
+  if(len == 0 || len > MAXSYMLINK)
+    return -1;
+
+  begin_op();
+  // create() fails if path already exists or its parent directory does not.
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
+    end_op();
+    return -1;
+  }
+  if(writei(ip, target, 0, len) != len){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+  return 0;
 }
